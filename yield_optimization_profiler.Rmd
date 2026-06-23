@@ -1,0 +1,1145 @@
+---
+title: "Univariate Analysis on a test dataset"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 5
+    number_sections: true
+    theme: journal
+---
+
+```{r rmarkdown_libraries, echo=FALSE}
+#install.packages(c("janitor", "dplyr", "ggplot2", "lubridate", "lsmeans", 
+#                   "tidyr", "broom", "DT", "stringi", "ggcorrplot", 
+#                   "knitr", "plotly", "heatmaply"))
+```
+
+```{r rmarkdown_setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F, fig.width = 9.25, fig.height=6)
+options(knitr.duplicate.label = "allow")
+withr::local_options(list(htmltools.preserve.raw = FALSE))
+
+```
+
+
+```{r libraries}
+# library(dataiku) # REMOVED FOR LOCAL USE
+library(janitor)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(lsmeans)
+library(tidyr)
+library(broom)
+library(DT)
+library(stringi)
+library(ggcorrplot)
+library(knitr)
+library(plotly)
+library(DT)
+library(heatmaply)
+
+```
+
+```{r configuration, echo=FALSE}
+# ==============================================================================
+# DATASET AND VARIABLE CONFIGURATION (CENTRALIZED CONTROL)
+# Modify the values below to adapt the script to a new file
+# ==============================================================================
+
+# 1. File Path (Local CSV)
+# Provide the relative or absolute path to your CSV file
+input_file_path <- "synthetic_vaccine_batch_data.csv" 
+
+# 2. Definition of "Pillar" Columns
+# WARNING: Use names as they will appear after automatic cleaning (janitor::clean_names)
+# i.e.: all lowercase, no accents, spaces replaced by underscores (_)
+col_target <- "vaccine_yield_g_l"              # Quantitative target variable (Y)
+col_date   <- "production_date"            # Date variable (Temporal X)
+col_id     <- "id_lot"                     # Unique identifier (for chronological order)
+
+# 3. Time Filtering Parameters
+# Leave NULL or "" if you do not want to filter on a specific bound
+filter_start_date <- "2024-01-01"  # Expected format: "YYYY-MM-DD"
+filter_end_date   <- "2026-12-31"  # Expected format: "YYYY-MM-DD"
+
+# 4. Date format in the original CSV file 
+# Examples: "%d-%m-%Y" (for 31-01-2024) or "%Y-%m-%d" (for 2024-01-31)
+input_date_format <- "%d-%m-%Y"
+
+# ==============================================================================
+```
+
+
+```{r dataset_upload, results='asis'}
+
+# Target variable assignment from config
+vy <- col_target
+
+# Load and clean dataset (LOCAL IMPORT)
+# check.names=F avoids R renaming columns (replacing spaces with dots) before clean_names does its job
+df_raw <- read.csv(input_file_path, sep = ";", dec = ".", check.names = FALSE, stringsAsFactors = FALSE) %>%
+  janitor::clean_names()
+
+# Check if columns exist after cleaning names
+required_cols <- c(col_target, col_date, col_id)
+if(!all(required_cols %in% names(df_raw))){
+  missing_cols <- setdiff(required_cols, names(df_raw))
+  stop(paste("ERREUR CRITIQUE : Les colonnes suivantes sont introuvables après le nettoyage des noms (clean_names) :", 
+             paste(missing_cols, collapse=", "), 
+             ". Vérifiez l'orthographe dans le bloc CONFIGURATION."))
+}
+
+# Remove rows where target variable is missing
+df_filtered <- df_raw %>%
+  filter(!is.na(.data[[vy]]))
+
+# --------------------------------------------- #
+# Parse date column (Robust Normalization)
+# --------------------------------------------- #
+if (col_date %in% colnames(df_filtered)) {
+  # Utilisation de lubridate pour gérer les formats mixtes (/, -, année 2 ou 4 chiffres)
+  # orders = c("dmy", "ymd") tente d'abord Jour-Mois-Année, puis Année-Mois-Jour
+  df_filtered <- df_filtered %>%
+    mutate(!!as.symbol(col_date) := as.Date(lubridate::parse_date_time(
+      .data[[col_date]], 
+      orders = c("dmy", "dmY", "ymd", "Ymd")
+    )))
+}
+
+# --------------------------------------------- #
+# Remove rows with missing or invalid dates
+# --------------------------------------------- #
+df_filtered <- df_filtered %>%
+  filter(!is.na(.data[[col_date]]))
+
+# --------------------------------------------- #
+# Filter by Date Range (Start / End) - NEW STEP
+# --------------------------------------------- #
+if(!is.null(filter_start_date) && filter_start_date != ""){
+  df_filtered <- df_filtered %>%
+    filter(.data[[col_date]] >= as.Date(filter_start_date))
+  cat(paste("Date Filter active : Data utilized from", filter_start_date, "\n"))
+}
+
+if(!is.null(filter_end_date) && filter_end_date != ""){
+  df_filtered <- df_filtered %>%
+    filter(.data[[col_date]] <= as.Date(filter_end_date))
+  cat(paste("Date Filter active : Data utilized to", filter_end_date, "\n"))
+}
+
+cat(paste0("\nNumber of rows kept after date filter : ", nrow(df_filtered), "\n\n"))
+
+# --------------------------------------------- #
+# Determine true chronological order of lots
+# --------------------------------------------- #
+lot_order_df <- df_filtered %>%
+  group_by(!!as.symbol(col_id)) %>%
+  summarise(min_date = min(!!as.symbol(col_date), na.rm = TRUE), .groups = "drop") %>%
+  arrange(min_date)
+
+ordered_lots <- lot_order_df %>% pull(!!as.symbol(col_id))
+
+# --------------------------------------------- #
+# Apply ordered factor to lots
+# --------------------------------------------- #
+df_filtered <- df_filtered %>%
+  mutate(!!as.symbol(col_id) := factor(.data[[col_id]], levels = ordered_lots))
+
+# --------------------------------------------- #
+# Detect and remove constant columns
+# --------------------------------------------- #
+cols_constant <- df_filtered %>%
+  summarise(across(everything(), ~ n_distinct(., na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_unique") %>%
+  filter(n_unique <= 1) %>%
+  pull(column)
+
+df_analysis <- df_filtered %>%
+  select(-all_of(cols_constant)) %>%
+  mutate(!!as.symbol(col_id) := factor(.data[[col_id]], levels = ordered_lots))  # reapply to ensure order
+
+# --------------------------------------------- #
+# Display removed columns
+# --------------------------------------------- #
+if (length(cols_constant) > 0) {
+  cat("### Removed Constant Columns\n\n\n\nThese columns had the same (non-missing) value across all rows and were removed from the analysis:\n\n")
+  print(knitr::kable(data.frame(Constant_Columns_Removed = cols_constant)), row.names = FALSE)
+} else {
+  cat(" No constant columns detected among non-missing rows for the target variable.\n")
+}
+
+```
+
+```{r early_param_definitions, include=FALSE}
+# Defines IDs based on configuration variables
+vparams_id <- c(col_id, col_date)
+
+vparam_quantitative <- df_analysis %>%
+  select(where(is.numeric)) %>%
+  colnames()
+```
+
+```{r functions_set_up}
+
+func_clean_title = function(v){return(gsub("_", " ", v))}
+# cleanvar = function(v){return(gsub("_", " ", v))}
+
+print_summary_loop = function(s){
+  length_element <- length(capture.output(s))
+  sapply(1:length_element, function(j) cat(paste0("`", ". ", capture.output(s)[j]), "`  \n"))
+}
+
+function_title <- function(vtitle, vheader_level = 4){
+  vtitle_return <- paste(paste(rep("#",vheader_level), collapse = ""), vtitle, "\n", collapse=" ")
+  return(cat(vtitle_return))
+}
+
+function_comment <- function(vcomment){
+  if(!is.null(vcomment)){cat(vcomment); cat("\n\n")}
+}
+
+print_summary_loop = function(s){
+  length_element <- length(capture.output(s))
+  sapply(1:length_element, function(j) cat(paste0("`", ". ", capture.output(s)[j]), "`  \n"))
+}
+
+theme_plot <- theme_bw() +  
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+
+generate_df_glance_only <- function(dfunc, vy, vparams_id, vparam_quantitative) {
+  df_univariate_quanti <- dfunc %>%
+    select(any_of(c(vparams_id, vparam_quantitative, vy)))
+
+  df_melt <- df_univariate_quanti %>%
+    pivot_longer(cols = -any_of(c(vparams_id, vy))) %>%
+    group_by(name) %>%
+    filter(!all(is.na(value))) %>%
+    filter(!is.na(value)) %>%
+    filter(!is.na(!!as.symbol(vy))) %>%
+    ungroup()
+
+  df_glance <- df_melt %>%
+    nest_by(name) %>%
+    mutate(mod = list(lm(as.formula(paste(vy, "~ value")), data = data, na.action=na.exclude))) %>%
+    reframe(glance(mod)) %>%
+    clean_names() %>%
+    arrange(desc(adj_r_squared)) %>%
+    mutate(
+      significativity = case_when(
+        p_value <= 0.05 ~ "significant",
+        p_value > 0.05 ~ "not significant"
+      ),
+      name = gsub("_", " ", name),
+      adj_r_squared = round_half_up(adj_r_squared * 100, 0)
+    )
+
+  assign("df_glance", df_glance, envir = .GlobalEnv)
+}
+
+vx_runchart <- col_id  # Linked to config variable
+vntick <- 2
+vy <- col_target       # Linked to config variable
+vy_txt <- func_clean_title(vy)
+
+```
+
+
+```{r runchart_function}
+
+runchart_function = function(
+    dfunc_runchart,
+    vx_runchart,
+    vy_runchart,
+    vmanufacturing_date = NULL,
+    vcolor_runchart = NULL,
+    vfacetx_runchart = ".",
+    vfacety_runchart = ".",
+    bool_show_color_legend = F,
+    bool_facet_scale = "free_y",
+    bool_vertical_line_per_year = T,
+    vtitle = NULL,
+    vntick = 5
+){
+  
+  vy_runchart_txt <- func_clean_title(vy_runchart)
+  vx_runchart_txt <- func_clean_title(vx_runchart)
+  vx_runchart_class <- dfunc_runchart %>% 
+    distinct(!!as.symbol(vx_runchart)) %>% 
+    pull() %>% 
+    class()
+  
+  prunchart <- ggplot(data = dfunc_runchart, aes_string(x = vx_runchart, y = vy_runchart, group = 1)) + 
+    geom_point(aes_string(color = vcolor_runchart), show.legend = bool_show_color_legend) + 
+    geom_line(color = "grey", linetype = "dotted") + 
+    facet_grid(reformulate(vfacetx_runchart, vfacety_runchart), scales = bool_facet_scale,
+               labeller = label_wrap_gen(width = 20, multi_line = TRUE)) + 
+    theme_plot + 
+    ylab(vy_runchart_txt) + 
+    xlab(vx_runchart_txt) + 
+    ggtitle(vtitle)
+  
+  if(vx_runchart_class %in% c("character", "factor")){
+    
+    vx_lot <-  dfunc_runchart %>% 
+      distinct(!!as.symbol(vx_runchart)) %>% 
+      pull()
+      
+    prunchart <- prunchart +
+      scale_x_discrete(breaks = vx_lot[seq(1, length(vx_lot), vntick)])
+
+  }
+  
+  if(is.null(vmanufacturing_date) & bool_vertical_line_per_year){
+      cat("The variable 'bool_vertical_line_per_year' is set to TRUE",
+          "But there were no variable 'vmanufacturing_date' variable set up.",
+          "\n")
+    }
+    
+  return(prunchart)
+  
+}
+
+
+```
+
+# Introduction
+
+## Descriptive analysis for all parameters
+
+The aim of this report is to identify the most impactful parameters on `r vy_txt` for each parameter.
+
+### Run chart 
+ 
+This first section introduces the run chart for this parameter overtime :
+
+```{r common_runchart}
+
+runchart_function(
+    dfunc_runchart = df_analysis,
+    vx_runchart = col_id,            # Uses config
+    vy_runchart = vy,
+    vmanufacturing_date = col_date,  # Uses config
+    vcolor_runchart = NULL,
+    #vcolor_runchart = NULL,
+    vfacetx_runchart = ".",
+    vfacety_runchart = ".",
+    bool_show_color_legend = F,
+    bool_facet_scale = "free_y",
+    bool_vertical_line_per_year = T,
+    vtitle = NULL,
+    vntick = 5
+)
+
+cat("\n\n")
+
+```
+
+### Correlation plot with the target variable (above |0.2|)
+
+This plot shows the Pearson correlation between each numeric parameter and the target variable `r func_clean_title(vy)`.
+
+
+```{r correlation plot}
+
+df_corr_numeric <- df_analysis %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(vy))
+
+# Check to ensure numeric columns exist
+if(ncol(df_corr_numeric) > 0) {
+  correlations <- sapply(df_corr_numeric, function(x) cor(x, df_analysis[[vy]], use = "complete.obs"))
+  
+  cor_df <- data.frame(
+    Variable = names(correlations),
+    Correlation = correlations
+  ) %>%
+    mutate(abs_corr = abs(Correlation)) %>%
+    filter(abs_corr > 0.2) %>%
+    arrange(Correlation) %>%
+    mutate(
+      Short_ID = paste0("Var", sprintf("%02d", row_number())),
+      Display = paste0(Short_ID, ": ", ifelse(nchar(Variable) > 45, paste0(substr(Variable, 1, 42), "..."), Variable)),
+      hover_txt = paste0("<b>", Variable, "</b><br>Correlation: ", round(Correlation, 3))
+    )
+  
+  if(nrow(cor_df) > 0){
+    cor_df$Display <- factor(cor_df$Display, levels = cor_df$Display)
+    
+    n_vars <- nrow(cor_df)
+    plot_height <- max(400, n_vars * 30)
+    
+    plot_ly(
+      data = cor_df,
+      x = ~Correlation,
+      y = ~Display,
+      type = 'bar',
+      orientation = 'h',
+      text = ~hover_txt,
+      hoverinfo = 'text',
+      marker = list(
+        color = ~Correlation,
+        colorscale = 'RdBu',
+        reversescale = TRUE,
+        line = list(color = "black", width = 0.5)
+      )
+    ) %>%
+      layout(
+        title = list(text = paste("Correlation with", func_clean_title(vy)), x = 0),
+        height = plot_height,
+        margin = list(l = 50, r = 30, t = 50, b = 50),
+        xaxis = list(title = "Pearson correlation", zeroline = TRUE),
+        yaxis = list(title = "", automargin = TRUE, showticklabels = FALSE)
+      )
+  } else {
+    cat("No variables found with correlation > 0.2")
+  }
+} else {
+  cat("Not enough numeric variables for correlation analysis.")
+}
+
+
+cat("\n\n")
+```
+<br><br><br>
+<br><br><br>
+<br><br><br>
+<br><br><br>
+
+
+<br><br><br>
+
+```{r setup_df_glance_for_table, include=FALSE}
+generate_df_glance_only(
+  dfunc = df_analysis,
+  vy = vy,
+  vparams_id = vparams_id,
+  vparam_quantitative = vparam_quantitative
+)
+```
+
+### Interactive table of univariate regressions
+
+```{r r2_navigation_table}
+# Vérifie si les régressions ont bien été calculées
+if(exists("df_glance") && nrow(df_glance) > 0) {
+  
+  # Préparation du tableau pour l'affichage
+  df_table_display <- df_glance %>%
+    arrange(desc(adj_r_squared)) %>%
+    mutate(
+      # Création des liens HTML pour la navigation interne
+      Parameter = paste0('<a href="#', gsub(" ", "-", stringi::stri_trans_general(name, "Latin-ASCII")), '">', name, '</a>'),
+      `Adjusted R² (%)` = adj_r_squared
+    ) %>%
+    select(Parameter, `Adjusted R² (%)`, significativity)
+  
+  # Affichage du tableau interactif
+  DT::datatable(
+    df_table_display,
+    escape = FALSE, # Important pour que les liens HTML fonctionnent
+    rownames = FALSE,
+    options = list(
+      pageLength = 10,
+      scrollX = TRUE,
+      order = list(list(1, 'desc'))
+    )
+  ) %>%
+    DT::formatStyle(
+      columns = c('Adjusted R² (%)', 'significativity'),
+      backgroundColor = DT::styleEqual(
+        c("significant", "not significant"),
+        c("#00BFC4", "#F8766D")
+      )
+    )
+} else {
+  cat("Aucune régression calculée ou le tableau est vide.")
+}
+```
+
+
+<br><br><br>
+
+
+
+### Global correlation table (above|0.5|) 
+```{r corr_data, echo=FALSE}
+
+# 1. Sélection des variables numériques valides
+df_corr <- df_analysis %>%
+  select(where(is.numeric)) %>%
+  select_if(~ sd(., na.rm = TRUE) > 0) %>%
+  select_if(~ sum(!is.na(.)) >= 3)
+
+# 2. Calcul de la matrice de corrélation pairwise
+cor_mat <- tryCatch({
+  cor(df_corr, use = "pairwise.complete.obs")
+}, error = function(e) NULL)
+
+if (is.null(cor_mat) || ncol(cor_mat) < 2) {
+  cat("Not enough numeric data to compute correlations.")
+} else {
+  # 3. Extraire les paires de corrélations
+  cor_df <- as.data.frame(as.table(cor_mat)) %>%
+    rename(Var1 = Var1, Var2 = Var2, Correlation = Freq) %>%
+    filter(Var1 != Var2) %>%
+    mutate(abs_corr = abs(Correlation)) %>%
+    rowwise() %>%
+    mutate(key = paste(sort(c(Var1, Var2)), collapse = "_")) %>%
+    ungroup() %>%
+    distinct(key, .keep_all = TRUE) %>%
+    select(-key)
+
+  # 4. Garder les plus fortes corrélations
+  top_cor <- cor_df %>%
+    filter(abs_corr >= 0.5) %>%
+    arrange(desc(abs_corr)) %>%
+    mutate(Correlation = round(Correlation, 3))
+
+  # 5. Affichage interactif
+  if (nrow(top_cor) == 0) {
+    cat("No strong correlations (|r| ≥ 0.5) found.")
+  } else {
+    datatable(
+      top_cor %>% select(Var1, Var2, Correlation),
+      caption = "Top correlated variable pairs (|r| ≥ 0.5)",
+      options = list(pageLength = 10, autoWidth = TRUE)
+    )
+  }
+}
+
+
+
+
+
+
+cat("\n\n")
+
+```
+<br><br><br>
+
+<br><br><br>
+
+
+
+```{r functions_for_univariate_quantitative_parameters}
+
+regression_func = function(
+  df_reg,
+  vx,
+  vy,
+  vx_runchart = col_id, # Uses config variable
+  vmanufacturing_date = col_date, # Uses config variable
+  vcolor_runchart = NULL,
+  vntick = 5,
+  vheader_level = 3
+    ){
+  
+  
+  # --------------------------------------------------------- #
+  # Initialisation
+  # --------------------------------------------------------- #
+  vy_txt <- func_clean_title(vy)
+  vx_txt <- func_clean_title(vx)
+  vx_runchart_txt <- func_clean_title(vx_runchart)
+  vcolor_runchart_txt <- func_clean_title(vcolor_runchart)
+  
+  df_runchart <- df_reg %>% 
+    arrange(!!as.symbol(vmanufacturing_date)) %>% 
+    mutate(
+      !!as.symbol(vx_runchart) := factor(!!as.symbol(vx_runchart), levels = unique(!!as.symbol(vx_runchart)))#,
+      ) %>% 
+    pivot_longer(cols = any_of(c(vx, vy))) %>% 
+    mutate(name = gsub("_", " ", name))
+
+  function_title(vtitle = func_clean_title(vx), vheader_level = vheader_level)
+  
+  function_title(vtitle = "Run chart", vheader_level = vheader_level + 1)
+  
+  cat("The following plot introduces the results of", vx_txt, " by ", vx_runchart_txt,".\n")
+  
+  prunchart <- runchart_function(
+    dfunc_runchart = df_runchart,
+    vx_runchart = vx_runchart,
+    vy_runchart = "value",
+    vmanufacturing_date = vmanufacturing_date,
+    vcolor_runchart = NULL,
+    #vcolor_runchart = vcolor_runchart,
+    vfacetx_runchart = ".",
+    vfacety_runchart = "name",
+    bool_show_color_legend = F,
+    bool_facet_scale = "free_y",
+    vtitle = paste0("Run chart of", "\n", vx_txt),
+    vntick = vntick
+  )
+  
+  plot(prunchart)
+  cat("\n\n")
+  
+  function_title(vtitle = "Linear regression", vheader_level = vheader_level + 1)
+  
+  function_title(vtitle = "Regression plot", vheader_level = vheader_level + 2)
+  
+  cat("The following section introduces the linear correlation between '", 
+      vx_txt, "' and '", vy_txt,"'.")
+  
+  pregplot <- ggplot(data = df_reg, aes_string(x = vx, y = vy)) + 
+    geom_point() + 
+    geom_smooth(method = "lm", color = "purple") + 
+    theme_plot + 
+    xlab(vx_txt) + 
+    ylab(vy_txt) + 
+    ggtitle(paste("Regression plot between", vy_txt, "\nand", vx_txt))
+  
+  plot(pregplot)
+  cat("\n\n")
+  
+  function_title(vtitle = "Model outputs", vheader_level = vheader_level + 2)
+  
+  function_title(vtitle = "Summary", vheader_level = vheader_level + 3)
+  
+  vformula_lm <- paste(vy, "~", vx)
+  # m <- lm(formula = as.formula(vformula_lm), data = df_reg)
+  
+  # to avoid very long names and rendering the reading uneasy,
+  # there is a renaming to be done
+  m <- lm(formula = as.formula(paste(vy, "~ variable")), 
+          data = df_reg %>% rename("variable" = vx))
+  s <- summary(m)
+  
+  invisible(print_summary_loop(s))
+  cat("\n\n")
+  
+  # print(s)
+  cat("\n\n")
+  
+  function_title(vtitle = "Hypotheses checking", vheader_level = vheader_level + 3)
+  
+  df_resid <- df_reg %>% 
+  bind_rows(
+      data.frame(
+        fitted = m$fitted.values,
+        resid = s$residuals
+        )
+  )
+
+  vy_val <- pretty(df_resid$resid)
+  
+  pqqplot <- ggplot(data = df_resid, aes(sample=resid)) + 
+    geom_qq() + 
+    geom_qq_line() +
+    theme_plot + 
+    ggtitle(paste0("Normal QQ-plot of the residuals\nfrom the linear regression")) + 
+    scale_y_continuous(labels = vy_val, breaks = vy_val, limits = range(vy_val))
+  
+  plot(pqqplot)
+  cat("\n\n")
+  
+  presidfit <- ggplot(data = df_resid, aes(x = fitted, y = resid)) + 
+    geom_point() + 
+    geom_hline(aes(yintercept = 0), color = "purple") + 
+    theme_plot + 
+    xlab("Fitted values by the linear regression") + 
+    ylab("Residuals") + 
+    ggtitle(paste0("Residual vs Fitted values\nfrom the linear regression")) + 
+    scale_y_continuous(labels = vy_val, breaks = vy_val, limits = range(vy_val))
+  
+  plot(presidfit)
+  cat("\n\n")
+  
+}
+
+root_univariate_numeric = function(
+    dfunc_univ_quanti = NULL,
+    vy = NULL,
+    vx_runchart = NULL,
+    vcolor_runchart = NULL,
+    vparams_id = NULL, 
+    vparam_quantitative = NULL,
+    vheader_level = 2,
+    vntick = 5
+){
+
+  function_title(vtitle = "Overall Linear regression overview", vheader_level = vheader_level)
+  
+  # --------------------------------------------------------- #
+  # Dataset preparation
+  # --------------------------------------------------------- #
+  df_univariate_quanti <- dfunc_univ_quanti %>% 
+    select(any_of(c(vparams_id, vparam_quantitative, vy))) 
+  
+  df_melt <- df_univariate_quanti %>%  
+    pivot_longer(cols = -any_of(c(vparams_id, vy))) %>% 
+    group_by(name) %>% 
+    filter(!all(is.na(value))) %>% 
+    filter(!is.na(value)) %>%
+    filter(!is.na(!!as.symbol(vy))) %>%
+    ungroup()
+
+  vx_param <- df_melt %>% distinct(name) %>% pull()
+  
+  # --------------------------------------------------------- #
+  # All linear models at once to get the adjusted R2
+  # --------------------------------------------------------- #
+  df_glance <- df_melt %>%
+    nest_by(name) %>%
+    mutate(mod = list(lm(as.formula(paste(vy, "~ value")), data = data, na.action=na.exclude))) %>%
+    reframe(glance(mod)) %>%
+    clean_names() %>%
+    arrange(adj_r_squared) %>%
+    mutate(
+      significativity = case_when(
+        p_value <= 0.05 ~ "significant",
+        p_value > 0.05 ~ "not significant"
+      ),
+      name = gsub("_", " ", name),
+      name = factor(name, levels = unique(name)),
+      adj_r_squared = round_half_up(adj_r_squared*100, 0),
+    )
+
+  function_title(vtitle = "Adjusted R2 overview", vheader_level = vheader_level + 1)
+  
+  vx_scale <- c(0, 100, df_glance %>% distinct(adj_r_squared) %>% pull())
+
+  poverview_regression_plot <-  ggplot(
+    data = df_glance %>% filter(adj_r_squared > 5), 
+    aes(x = adj_r_squared, y = name, color = significativity)) + 
+    geom_segment(aes(x = 0, y = name, xend = adj_r_squared, yend = name), 
+                 color = "grey", linewidth = 0.2) + 
+    geom_point(size = 7) + 
+    geom_text(aes(x = adj_r_squared, y = name, label = adj_r_squared), color = 'black', size = 3) +
+    xlab("Adjusted R2 (%)") + 
+    theme_plot + 
+    theme(axis.text.y = element_text(size = 6)) +  
+    ggtitle(paste("Overall adjusted R2 (%) plot from linear regression",
+                  "\nBetween each parameter and", gsub("_", " ", vy),
+                  "\nOnly R2 > 5% are shown")) +
+    scale_color_manual(
+      values = c(
+        "significant" = "#00BFC4",
+        "not significant"="#F8766D"
+        )
+      ) + 
+    scale_x_continuous(
+      breaks = pretty(vx_scale), 
+      labels = pretty(vx_scale), limits = range(vx_scale)
+      )
+  
+  # Ajustement local de la hauteur uniquement pour ce plot
+  knitr::opts_chunk$set(fig.height = max(8, length(vx_param) * 1.5))
+  suppressWarnings(print(poverview_regression_plot))
+  knitr::opts_chunk$set(fig.height = 6)  # réinitialise après
+  cat("\n\n")
+  # --------------------------------------------------------- #
+  # Tableau de navigation vers les régressions individuelles
+  # --------------------------------------------------------- #
+  assign("df_glance", df_glance, envir = .GlobalEnv)
+
+
+
+
+
+  
+  # --------------------------------------------------------- #
+  #  plot
+  # --------------------------------------------------------- #
+
+  
+  cat("\n\n")
+  
+  # --------------------------------------------------------- #
+  # Apply function for each of the quantitative parameter
+  # --------------------------------------------------------- #
+  function_title(vtitle = "Analysis by parameter", vheader_level = vheader_level)
+  
+  for(i in 1:length(vx_param)){
+    
+    regression_func(
+      df_reg = df_univariate_quanti,
+      vx = vx_param[i],
+      vy = vy,
+      vx_runchart = vx_runchart,
+      vcolor_runchart = vcolor_runchart,
+      vntick = vntick,
+      vheader_level = vheader_level + 1,
+      vmanufacturing_date = col_date # Uses config variable
+    )   
+  } 
+}
+
+
+```
+
+
+```{r functions_for_univariate_qualitative_parameters}
+
+qualitative_analysis_one_parameter = function(
+    dfunc_quali_one_analysis,
+    vx,
+    vy,
+    vx_runchart,
+    vcolor_runchart = NULL,
+    vheader_level = 3,
+    vntick = 3,
+    vmanufacturing_date = col_date # Uses config variable
+    ){
+  
+  # --------------------------------------------------------- #
+  # Initialisation
+  # --------------------------------------------------------- #
+  vy_txt <- func_clean_title(vy)
+  vx_txt <- func_clean_title(vx)
+  vx_runchart_txt <- func_clean_title(vx_runchart)
+  
+  # dfunc_melt_child <- dfunc_quali_one_analysis %>%
+  #    select(any_of(c(vx, vy, vx_runchart))) %>% 
+  #    pivot_longer(cols = !!as.symbol(vx)) %>% 
+  #    filter(!(
+  #      is.na(value) | is.na(!!as.symbol(vy))
+  #      )
+  #    )
+  
+  function_title(vtitle = vx_txt, vheader_level = vheader_level)
+  
+  cat("The following plot introduces the results of '", vy_txt,"' colored by '", vx_runchart_txt, "'.\n\n")
+  
+  function_title(vtitle = "Descriptive analysis", vheader_level = vheader_level + 1)
+
+  function_title(vtitle = "Run chart", vheader_level = vheader_level + 2)
+  
+  prunchart_one_parameter <- runchart_function(
+      dfunc_runchart = dfunc_quali_one_analysis,
+      vx_runchart = vx_runchart,
+      vy_runchart = vy,
+      vmanufacturing_date = vmanufacturing_date,
+      vcolor_runchart = vx,
+      vfacetx_runchart = ".",
+      vfacety_runchart = ".",
+      bool_show_color_legend = F,
+      bool_facet_scale = "free_y",
+      vtitle = paste0("Run chart of ", vy_txt, " colored by\n", vx_txt),
+      vntick = vntick
+  )
+  
+  plot(prunchart_one_parameter)
+  cat("\n\n")
+  
+
+  # function_title(vtitle = "Scatterplot", vheader_level = vheader_level + 2)
+  # 
+  # pscatter_plot <- ggplot(data = dfunc_melt_child %>% 
+  #                            mutate(
+  #                              name = gsub("_", " ", name),
+  #                              value = gsub("_", " ", value)
+  #                              ), 
+  #                          aes_string(x = "value", y = vy, 
+  #                                      group = "value", color = "value")) + 
+  #      geom_violin(alpha = 0.1, linewidth = 0.2, show.legend = F) + 
+  #      geom_jitter(height = 0, width = 0.2, show.legend = F) + 
+  #      theme_plot + 
+  #      facet_grid(~name) + 
+  #      ggtitle(paste0("Scatterplot of ", vy_txt, "\nby levels of ", vx_txt)) +
+  #    ylab(vy_txt)
+  # 
+  # plot(pscatter_plot)
+  # cat("\n\n")
+  
+  function_title(vtitle = "Model", vheader_level = vheader_level + 2)
+
+  function_title(vtitle = "Homogeneity of Variance Between Groups", vheader_level = vheader_level + 2)
+  
+  df_model <- dfunc_quali_one_analysis %>%
+    # filter(!(is.na(!!as.symbol(vx)) | is.na(!!as.symbol(vy)))) %>%
+    mutate(!!as.symbol(vx) := factor(!!as.symbol(vx), levels = unique(!!as.symbol(vx))))
+  
+  cat("The homogeneity of variance between groups is assessed via a Levene test.\n\n")
+  vformula <- as.formula(paste(vy, "~ ", vx))
+  # res_levene <- leveneTest(vformula, data = df_model)
+  # 
+  # invisible(print_summary_loop(res_levene))
+  # cat("\n\n")
+  
+  # levene_pval <- res_levene$`Pr(>F)`[1]
+  # if(levene_pval <= 0.05){
+  # cat("The Levene test shows significant difference of variability between groups.\n\n")
+  # }
+  # if(levene_pval > 0.05){
+  #   cat("The Levene test did not detect significant difference of variability between groups.\n\n")
+  # }
+  
+  function_title(vtitle = "Model outputs", vheader_level = vheader_level + 2)
+  
+  function_title(vtitle = "Summary", vheader_level = vheader_level + 3)
+  
+  cat("The obtained values are:\n")
+  
+  m <- lm(formula = vformula, data = df_model)
+  s <- summary(m)
+  invisible(print_summary_loop(s))
+  cat("\n\n")
+    
+  cat("The confidence intervals can be plotted:\n") 
+  df_confint <- lsmeans::lsmeans(m, vx) %>% 
+      as.data.frame() %>% 
+      clean_names() %>% 
+      rename("modality" = vx) %>% 
+      arrange(lsmean) %>% 
+      mutate(modality=factor(modality, levels = unique(modality))) 
+  
+  pconfint <- ggplot(df_confint, aes(x = lsmean, y = modality)) + 
+    geom_point() + 
+    geom_errorbar(
+      aes(xmin = lower_cl, xmax = upper_cl, 
+        color = modality), width = 0.2) +
+    geom_point(data = df_model, 
+               aes_string(x = vy, y = vx, color = vx)) +
+    theme_plot + 
+    geom_label(aes(label = round_half_up(lsmean, 1))) + 
+    ggtitle(paste("Estimated least mean squares and associated 95% confidence",
+                  "\nby the model")) 
+  
+  plot(pconfint)
+  cat("\n\n")
+  
+  # function_title(vtitle = "Hypotheses checking", vheader_level = vheader_level + 3)
+  # 
+  # cat("Test for detecting violation of normality assumption: \n")
+  # list_resid_normality <- ols_test_normality(m)
+  # list_resid_normality
+
+}
+
+root_univariate_qualitative = function(
+    dfunc_univ_quali = NULL,
+    vy = NULL,
+    vx_runchart = col_id, # Uses config variable
+    vparams_id = NULL,
+    vparam_qualitative  = NULL, 
+    vheader_level = 2,
+    vntick = 5,
+    vmanufacturing_date = col_date, # Uses config variable
+    vcolor_runchart = NULL
+){
+
+  # --------------------------------------------------------- #
+  # Dataset preparation
+  # --------------------------------------------------------- #
+  df_univariate_quali <- dfunc_univ_quali %>% 
+    select(any_of(c(vparams_id, vparam_qualitative, vy))) 
+  
+  df_melt <- df_univariate_quali %>%  
+    pivot_longer(cols = -any_of(c(vparams_id, vy))) %>% 
+    group_by(name) %>% 
+    filter(!is.na(value)) %>%
+    filter(!(n_distinct(value) == n())) %>%
+    filter(!n_distinct(value) == 1) %>% 
+    ungroup()
+
+  vparam_quali_func <- df_melt %>% distinct(name) %>% pull() %>% sort()
+  
+  # --------------------------------------------------------- #
+  # Initialisation
+  # --------------------------------------------------------- #
+  vy_txt <- func_clean_title(vy)
+  vx_runchart_txt <- func_clean_title(vx_runchart)
+  
+  # --------------------------------------------------------- #
+  # Overall plot
+  # --------------------------------------------------------- #
+  
+  function_title(vtitle = "Overall plot", vheader_level = vheader_level)
+
+  # Divide parameters in groups of 5 
+  group_size <- 3
+  group_list <- split(vparam_quali_func, ceiling(seq_along(vparam_quali_func)/group_size))
+
+  for(i in seq_along(group_list)){
+
+    vars_subset <- group_list[[i]]
+
+    prunchart_quali <- runchart_function(
+      dfunc_runchart = df_melt %>% filter(name %in% vars_subset) %>% mutate(name = gsub("_", " ", name)),
+      vx_runchart = vx_runchart,
+      vy_runchart = vy,
+      vmanufacturing_date = vmanufacturing_date,
+      vcolor_runchart = "value",
+      vfacetx_runchart = ".",
+      vfacety_runchart = "name",
+      bool_show_color_legend = F,
+      bool_facet_scale = "free_y",
+      vtitle = paste0("Run chart of\n", vx_runchart_txt, " – Group ", i, "/", length(group_list)),
+      vntick = vntick
+    ) +
+      theme(
+        strip.text = element_text(size = 6),
+        axis.text.x = element_text(size = 6, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 6)
+      )
+
+    knitr::opts_chunk$set(fig.height = max(6, length(vars_subset) * 3.2))
+    print(prunchart_quali)
+    knitr::opts_chunk$set(fig.height = 6)
+
+    cat("\n\n")
+  }
+
+
+
+  
+  # --------------------------------------------------------- #
+  # Apply function for each of the quantitative parameter
+  # --------------------------------------------------------- #
+  function_title(vtitle = "Analysis by parameter", vheader_level = vheader_level)
+  
+  for(j in 1:length(vparam_quali_func)){
+    
+    # j <- 6
+    # vx <- vparam_quali_func[j]
+    
+    qualitative_analysis_one_parameter(
+      dfunc_quali_one_analysis = df_univariate_quali,
+      vx = vparam_quali_func[j],
+      vy = vy,
+      vx_runchart = vx_runchart,
+      vcolor_runchart = vcolor_runchart,
+      vheader_level = vheader_level + 1,
+      vmanufacturing_date = vmanufacturing_date
+    )
+    
+    cat("\n\n")
+    
+  }
+  
+}
+
+```
+
+
+
+```{r global_function}
+
+global_function = function(
+    dfunc = df_analysis, 
+    vy = NULL,
+    vcolor_runchart = NULL,
+    vparams_id = NULL,
+    vx_runchart = NULL,
+    vparam_quantitative = NULL,
+    vparam_qualitative = NULL,
+    vheader_level = 2,
+    vntick = 5
+){
+  
+  # --------------------------------------------------------- #
+  # Initialisation
+  # --------------------------------------------------------- #
+  # --------------------------------------------------------- #
+  # Univariate analyses
+  # --------------------------------------------------------- #
+  function_title(vtitle = "Univariate analyses", vheader_level = vheader_level + 1)
+  
+  # --------------------------------------------------------- #
+  # Univariate analyses : quantitative
+  # --------------------------------------------------------- #
+  if(!is.null(vparam_quantitative)){
+    
+    function_title(vtitle = "Quantitative parameters", vheader_level = vheader_level + 2)
+  
+    root_univariate_numeric(
+      dfunc_univ_quanti = dfunc,
+      vy = vy,
+      vx_runchart = vx_runchart,
+      vcolor_runchart = vcolor_runchart,
+      vparams_id = vparams_id, 
+      vparam_quantitative = vparam_quantitative,
+      vheader_level = vheader_level + 3,
+      vntick = vntick
+    )
+    
+  }
+
+  # --------------------------------------------------------- #
+  # Univariate analyses : qualitative
+  # --------------------------------------------------------- #
+  if(!is.null(vparam_qualitative)){
+    
+    function_title(vtitle = "Qualitative parameters", vheader_level = vheader_level + 2)
+  
+    root_univariate_qualitative(
+      dfunc_univ_quali = dfunc,
+      vy = vy,
+      vx_runchart = vx_runchart,
+      vcolor_runchart = vcolor_runchart,
+      vparams_id = vparams_id , 
+      vparam_qualitative = vparam_qualitative,
+      vheader_level = vheader_level + 3,
+      vntick = vntick,
+      vmanufacturing_date = col_date # Passed from config
+    )
+    
+  }
+
+  # function_title(vtitle = "Multivariate analyses", vheader_level = vheader_level + 1)
+  
+}
+
+```
+
+
+
+```{r global_param_initilisation}
+
+# Parameters initialized dynamically from configuration above
+vparams_id <- c(
+  col_id,
+  col_date
+)
+
+vparam_quantitative <- df_analysis %>% 
+  select(where(is.numeric)) %>% 
+  colnames()
+
+vparam_qualitative <- df_analysis %>% 
+  select(where(is.character)) %>% 
+  colnames()
+
+```
+
+```{r global_function_execution, results='asis'}
+
+# Arguments now use the dynamic variables (vx_runchart, etc)
+# which were set in 'definition_for_rest_of_the_script' based on config
+
+global_function(
+    dfunc = df_analysis, 
+    vy = vy,
+    vparams_id = vparams_id,
+    vx_runchart = vx_runchart,
+    vcolor_runchart = NULL,
+    vparam_quantitative = vparam_quantitative,
+    vparam_qualitative = vparam_qualitative,
+    vheader_level = 1,
+    vntick = 5
+)
+
+```
+
+
+# Appendix
+
+## R session
+
+This report was generated with this setting :
+
+```{r}
+sessionInfo()
+```
+
+## Date of report generation
+
+This report was generated at `r now()`.
